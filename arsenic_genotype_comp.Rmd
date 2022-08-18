@@ -1,0 +1,359 @@
+---
+title: "Arsenic Genotype Comparison"
+author: "DMG"
+date: "8/16/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(qtl2convert)
+library(qtl2)
+library(readxl)
+library(tidyverse)
+
+base_dir = 'C:/Users/c-dgatti/Documents/projects/arsenic_do'
+data_dir = file.path(base_dir, 'data')
+results_dir = file.path(base_dir, 'results')
+
+# Genotype files.
+gigamuga_geno_file = file.path(data_dir, 'Jackson_Lab_Korstanje__GigaMUGA_genoprobs_8state_69k_sorted.rds')
+gbrs_geno_file     = file.path(results_dir, 'arsenic_gbrs_alleleprobs.rds')
+gigamuga_redo_file = file.path(data_dir, '43_DO_Korstanje_Redo__GigaMUGA_genoprobs_8state_69k.rds')
+gigamuga_cell_file = file.path(data_dir, 'cell_gig_data__GigaMUGA_genoprobs_8state_69k.rds')
+marker_file        = 'C:/Users/c-dgatti/Documents/muga/gm_uwisc_v1.csv'
+grid69k_file       = file.path(data_dir, 'ref.genome_grid.69k.noYnoMT_KBEdit.txt')
+
+# Sample annotation file.
+metadata_file   = file.path(data_dir, 'ArsenicAnimalMetadata.csv')
+mouse_giga_file = file.path(data_dir, 'Arsenic Extracted DNA.xlsx')
+rnaseq_file     = file.path(data_dir, 'RNAseq_input.csv')
+phase1_file     = file.path(data_dir, 'RNAseq arsenic with fastq phase I.xlsx')
+```
+
+# Arsenic Project Genotype Comparison
+
+There are roughly 570 mice listed in the arsenic project. I don't currently have an exhaustive list of mouse IDs with sex, dose, generation and a cross-reference between mouse, cell lines, Neogen DNA, and bulk RNA-seq.
+
+I want to make sure that the genotypes from the Gigamuga match the EMASE/GBRS genotypes in the RNA-seq data.
+
+## Genotype Files
+
+There are three separate Gigamuga files:
+
+1. Jackson_Lab_Korstanje__GigaMUGA_genoprobs_8state_69k_sorted.rds: The first batch Gigamuga file using DNA from the spleens of mice.
+2. 43_DO_Korstanje_Redo__GigaMUGA_genoprobs_8state_69k.rds: A set of 43 samples which were re-run because they failed QC in the first batch.
+3. cell_gig_data__GigaMUGA_genoprobs_8state_69k.rds: Cell lines run to try to fill in mouse samples that failed QC in both of the first two batches.
+
+There is one GBRS file:
+
+1. arsenic_gbrs_alleleprobs.rds: Allele probabilities for 282 samples. 
+
+## Annotation Files
+
+Arsenic Extracted DNA.xlsx: 571 rows, 4 columns. Each row represents one mouse. 
+                            Column names:
+                            Extracted DNA: ID for extracted DNA sent to Neogen.
+                            Spleen Sample: ID for spleen samples.
+                            Animal:        Mouse ID.
+                            Wave:          Wave of the experiment.
+
+RNAseq_input.csv: 182 rows, 7 columns. Each row represents one RNA-seq sample.
+                  No column names, but I'm inferring them.
+                  1: dose of arsenic in ppm
+                  2: sex of mouse
+                  3: Mouse ID.
+                  4: File name of R1 FASTQ file. RNA-seq ID is embedded in name.
+                  5: tissue
+                  6: DO outbreeding generation
+                  7: File name of R2 FASTQ file. RNA-seq ID is embedded in name.
+
+muga_to_id.csv: 626 rows, 5 columns.
+                Column names:
+                Project: Experiment project name.	
+                Investigator: Principal investigator name.
+                Directory: Directory name of Gigamuga file.
+                id: Extracted DNA ID.
+                Unique.Sample.ID:
+                
+ArsenicAnimalMetadata.csv: 565 rows, 5 columns.
+                           Column Names:
+                           Name: Mouse ID
+                           Sex: Sex of mouse (Female or Male)
+                           Generation: DO outbreeding generation (G34 - G37).
+                           Diet: Diet with dose of As.
+                           Birth Date: Birth date.
+
+
+I am trying to re-generate genoprobs using the Study Intake Platform. It's still processing right now.
+I have genotypes extracted from the EMASE output and genoprobs from GBRS on the 69K grid. I'd like to do
+this to verify that no mixups occurred during genotype processing.
+
+## Load Data
+
+Read in the Gigamuga marker grid.
+
+```{r read_markers}
+markers = read_csv(marker_file) %>%
+            filter(chr %in% c(1:19, 'X')) %>%
+            mutate(bp_mm10 = bp_mm10 * 1e-6) %>%
+            as.data.frame()
+marker_map = qtl2convert::map_df_to_list(markers, pos_column = 'bp_mm10')
+  
+grid69k = read_delim(grid69k_file, delim = '\t') %>%
+            as.data.frame()
+grid69k_map = qtl2convert::map_df_to_list(grid69k, pos_column = 'pos')
+```
+
+
+Read in GBRS genoprobs. These are in DOQTL format on the 69K grid.
+
+```{r read_gbrs_geno}
+gbrs = readRDS(gbrs_geno_file)
+gbrs = qtl2convert::probs_doqtl_to_qtl2(gbrs, map = grid69k, pos_column = 'pos')
+gc()
+```
+
+Read in Gigamuga genoprobs. These are on the 69K grid, but are in DOQTL format.
+
+```{r read_gigamuga_geno}
+giga = readRDS(gigamuga_geno_file)
+giga = qtl2convert::probs_doqtl_to_qtl2(giga, map = grid69k, pos_column = 'pos')
+```
+
+Read in the second batch of Gigamuga data.  These are on the 69K grid, but are in DOQTL format.
+
+```{r read_gigamuga_geno2}
+giga2 = readRDS(gigamuga_redo_file)
+giga2 = qtl2convert::probs_doqtl_to_qtl2(giga2, map = grid69k, pos_column = 'pos')
+```
+
+
+## Verify Markers Identical
+
+Verify that the markers in both files have the same markers. We're using the 69K grid.
+
+```{r verify_same_markers}
+all(sapply(gbrs, dim)[3,] == sapply(giga,  dim)[3,])
+all(sapply(gbrs, dim)[3,] == sapply(giga2, dim)[3,])
+```
+
+## Verify Sample Identity
+
+Verify that the sample IDs in the GBRS data are a subset of the sample IDs in the Gigamuga data.
+
+```{r verify_sample_subset}
+all(rownames(gbrs[[1]]) %in% rownames(giga[[1]]))
+```
+
+The sample IDs are different. What proportion of GBRS samples don't match the Gigamuga samples?
+
+```{r check_prop_sample_match}
+mean(rownames(gbrs[[1]]) %in% rownames(giga[[1]]))
+```
+
+No samples match between the Gigamuga and GBRS data.
+
+Check the sample matching between the redo and GBRS samples.
+
+```{r verify_sample_subset2}
+all(rownames(gbrs[[1]]) %in% rownames(giga2[[1]]))
+```
+
+
+
+### Read Sample Annotation
+
+I'll use the annotation files listed at the beginning of the document to assign mouse IDs to each sample.
+
+```{r read_sample_annot}
+metadata   = read_csv(metadata_file)
+mouse_giga = read_xlsx(mouse_giga_file)
+mouse_rna  = read_csv(rnaseq_file, col_names = FALSE)
+colnames(mouse_rna) = c('dose', 'sex', 'mouse', 'fastq1', 'tissue', 'gen', 'fastq2')
+```
+
+Which IDs are used in the first batch of Gigamuga data?
+
+```{r sample_id_giga}
+# Remove prefix from Sample IDs.
+for(i in seq_along(giga)) {
+  rownames(giga[[i]]) = gsub('^Jackson_Lab_Korstanje_MURGIGV01_[0-9]+_|_[A-H][0-9]+', '', rownames(giga[[i]]))
+} # for(i)
+
+mean(rownames(giga[[1]]) %in% mouse_giga$`Extracted DNA`)
+```
+
+Most of the samples in the Gigamuga data are in the Gigamuga sample file. The Gigamuga data has been filtered, so this may be OK.
+
+Which IDs are used in the second batch of Gigamuga data?
+
+```{r sample_id_giga2}
+# Remove prefix from Sample IDs.
+for(i in seq_along(giga2)) {
+  rownames(giga2[[i]]) = gsub('^Jackson_Lab_Korstanje_MURGIGV01_[0-9]+_|_[A-H][0-9]+', '', rownames(giga2[[i]]))
+} # for(i)
+
+mean(rownames(giga2[[1]]) %in% mouse_giga$`Extracted DNA`)
+```
+
+Which IDs are used in the GBRS data?
+
+```{r sample_id_gbrs}
+mouse_rna$id = gsub('_GT22-[0-9]+_[ACGT]+-[ACGT]+_S[0-9]+_L[0-9]+_R[0-9]_[0-9]+\\.fastq\\.gz$', '', mouse_rna$fastq1)
+mean(rownames(gbrs[[1]]) %in% mouse_rna$id)
+```
+
+All of the kidney RNA-seq samples are in the annotation file. I'm not sure about the phase I samples, which were from heart, liver, and kidney in the 0 and 10 ppm dose groups.
+
+### Assign Mouse IDs
+
+Assign mouse IDs to first batch Gigamuga data.
+
+```{r assign_mouse_giga}
+m = match(rownames(giga[[1]]), mouse_giga$`Extracted DNA`)
+
+giga_match = cbind(rownames(giga[[1]]), mouse_giga$`Extracted DNA`[m], mouse_giga$Animal[m])
+
+for(i in seq_along(giga)) {
+  rownames(giga[[i]])[!is.na(m)] = mouse_giga$Animal[m[!is.na(m)]]
+} # for(i)
+```
+
+Print out the table of first batch Gigamuga sample to Mouse ID.
+
+```{r}
+giga_match
+```
+
+Assign mouse IDs to second batch Gigamuga data.
+
+```{r assign_mouse_giga2}
+m = match(rownames(giga2[[1]]), mouse_giga$`Extracted DNA`)
+
+giga2_match = cbind(rownames(giga2[[1]]), mouse_giga$`Extracted DNA`[m], mouse_giga$Animal[m])
+
+for(i in seq_along(giga2)) {
+  rownames(giga2[[i]])[!is.na(m)] = mouse_giga$Animal[m[!is.na(m)]]
+} # for(i)
+```
+
+Print out the table of second batch Gigamuga sample to Mouse ID.
+
+```{r}
+giga2_match
+```
+
+
+Assign mouse IDs to GBRS data.
+
+```{r assign_mouse_gbrs}
+m = match(rownames(gbrs[[1]]), mouse_rna$id)
+
+gbrs_match = cbind(rownames(gbrs[[1]]), mouse_rna$id[m], mouse_rna$mouse[m])
+
+for(i in seq_along(gbrs)) {
+   rownames(gbrs[[i]]) = mouse_rna$mouse[m]
+} # for(i)
+```
+
+Print out the table of Gigamuga sample to Mouse ID.
+
+```{r}
+gbrs_match
+```
+
+## Genoprobs Comparison
+
+Retain the intersection of the samples in the Gigamuga and GBRS data.
+
+```{r intersect_samples}
+samples = intersect(c(rownames(giga[[1]]), rownames(giga2[[1]])), rownames(gbrs[[1]]))
+length(samples)
+```
+
+There are only `r length(samples)` samples that are common between the two datasets. The RNA-seq data has `r nrow(gbrs[[1]])` samples, so there are a lot missing. Use the intersection for now, but I'll need to find the other samples.
+
+```{r subset_samples}
+for(i in seq_along(giga)) {
+  giga[[i]]  = giga[[i]][rownames(giga[[i]])   %in% samples,,]
+  giga2[[i]] = giga2[[i]][rownames(giga2[[i]]) %in% samples,,]
+  gbrs[[i]]  = gbrs[[i]][samples,,]
+} # for(i)
+```
+
+Combine the two Gigamuga data sets.
+
+```{r combine_giga}
+new_giga = vector('list', length = length(giga))
+names(new_giga) = names(giga)
+
+for(i in seq_along(giga)) {
+  
+  comb_samples = c(rownames(giga[[i]]), rownames(giga2[[i]]))
+  new_giga[[i]] = array(0, dim = c(length(comb_samples), ncol(giga[[i]]), dim(giga[[i]])[[3]]), 
+                        dimnames = list(comb_samples, colnames(giga[[i]]), dimnames(giga[[i]])[[3]]))
+  new_giga[[i]][1:nrow(giga[[i]]),,] = giga[[i]]
+  new_giga[[i]][(nrow(giga[[i]]) + 1):nrow(new_giga[[i]]),,] = giga2[[i]]
+  
+} # for(i)
+
+rm(giga, giga2)
+gc()
+```
+
+Reorder the samples to be identical in both the Gigamuga and GBRS data.
+
+```{r reorder_samples}
+for(i in seq_along(new_giga)) {
+  new_giga[[i]] = new_giga[[i]][samples,,]
+  gbrs[[i]]     = gbrs[[i]][samples,,]
+} # for(i)
+stopifnot(all(rownames(new_giga[[1]]) == rownames(gbrs[[1]])))
+```
+
+Convert both probs objects to 3D arrays to make the comparison easier.
+
+```{r probs2array}
+# NOTE: Couldn't get the qtl2convert function to work. It producced a lot of NAs.
+#       Not sure if it's user error or bug.
+chr_len = sapply(new_giga, dim)[3,]
+mkr_names = unlist(sapply(new_giga, function(z) { dimnames(z)[[3]] }))
+ng = array(0, dim = c(nrow(new_giga[[1]]), ncol(new_giga[[1]]), sum(chr_len)), 
+           dimnames = list(rownames(new_giga[[1]]), colnames(new_giga[[1]]), mkr_names))
+gb = array(0, dim = c(nrow(gbrs[[1]]), ncol(gbrs[[1]]), sum(chr_len)), 
+           dimnames = list(rownames(gbrs[[1]]), colnames(gbrs[[1]]), mkr_names))
+
+chr_len = c(0, cumsum(chr_len))
+
+for(i in seq_along(new_giga)) {
+  ng[,,(chr_len[i]+1):chr_len[i+1]] = new_giga[[i]]
+  gb[,,(chr_len[i]+1):chr_len[i+1]] = gbrs[[i]]
+  #print(paste(chr_len[i]+1, chr_len[i+1]))
+} # for(i)
+
+new_giga = ng
+gbrs     = gb
+rm(ng, gb)
+```
+
+Compare each sample.
+
+```{r compare_samples}
+ng2 = sqrt(apply(new_giga^2, c(1,3), sum))
+gb2 = sqrt(apply(gbrs^2,    c(1,3), sum))
+
+num = apply(new_giga * gbrs, c(1, 3), sum)
+
+sample_comp = num / (ng2 * gb2)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+image(new_giga[1,,])
+image(gbrs[1,,])
+```
+
+
+
