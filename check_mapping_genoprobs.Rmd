@@ -1,0 +1,201 @@
+---
+title: "Check Mapping Genotypes"
+author: "DMG"
+date: "8/18/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(qtl2convert)
+library(qtl2)
+library(tidyverse)
+
+base_dir    = 'C:/Users/c-dgatti/Documents/projects/arsenic_do'
+data_dir    = file.path(base_dir, 'data')
+results_dir = file.path(base_dir, 'results')
+
+callan_file = file.path(data_dir, 'callan_genoprobs.rds')
+divdb_file  = file.path(data_dir, 'churchill14__GigaMUGA_genoprobs_8state.rds')
+
+marker_file = 'C:/Users/c-dgatti/Documents/muga/gm_uwisc_v1.csv'
+```
+
+## Introduction
+
+There is a genoprobs object that was used for QTL mapping. The samples are a mixture of DNA isolated from mice and cell lines. Also, some samples were repeated because they failed QC in the first batch.
+
+Input files:
+
+callan_genoprobs.rds: qtl2-style genoprobs object. List containing 20 items. Each item is a 3D numeric array. It contains 621 samples and 137,220 markers.
+
+churchill14__GigaMUGA_genoprobs_8state.rds: qtl2-style genoprobs object, downloaded form DivDB. List containing 20 items. Each item is a 3D numeric array. It contains 621 samples and 137,220 markers.
+
+## Load Data
+
+```{r read_data}
+callan = readRDS(callan_file)
+divdb  = readRDS(divdb_file)
+markers = read_csv(marker_file) %>%
+            as.data.frame()
+```
+
+How many samples are in each data set?
+
+```{r num_samples}
+nrow(callan[[1]])
+nrow(divdb[[1]])
+```
+
+Are the sample ID's unique in each data set?
+
+```{r unique_sample_callan}
+length(unique(rownames(callan[[1]])))
+```
+
+```{r unique_sample_divdb}
+length(unique(rownames(divdb[[1]])))
+```
+
+All of the sample IDs are unique.
+
+How many markers are in each file?
+
+```{r marker_ct}
+rowSums(sapply(callan, dim))[3]
+rowSums(sapply(divdb,  dim))[3]
+```
+
+They both have the same number of markers.
+
+Are the marker IDs identical?
+
+```{r markers_identical}
+m1 = unlist(sapply(callan, function(z) { dimnames(z)[[3]] }))
+m2 = unlist(sapply(divdb,  function(z) { dimnames(z)[[3]] }))
+all(m1 == m2)
+rm(m1, m2)
+```
+
+All of the markers are in identical order.
+
+Subset the markers to include only those being used in the data.
+
+```{r subset_markers}
+mkrs = unlist(sapply(callan, function(z) { dimnames(z)[[3]] }))
+markers = markers %>%
+            filter(marker %in% mkrs) %>%
+            mutate(bp_mm10 = bp_mm10 * 1e-6)
+map = map_df_to_list(markers, pos_column = 'bp_mm10')
+```
+
+
+### Check Number of Crossovers
+
+```{r count_xo}
+get_xo = function(pr) {
+
+  # Multiply by 2 and round to get 0, 1 or 2 genotypes.
+  pr  = round(2 * pr)
+  # Add one marker at the beginning of the probs.
+  tmp = array(0L, dim = c(nrow(pr), ncol(pr), dim(pr)[3] + 1),
+              dimnames = list(rownames(pr), colnames(pr), c('start', dimnames(pr)[[3]]) ))
+  tmp[,,2:dim(tmp)[3]] = pr
+  pr = tmp
+  rm(tmp)
+  # Take the difference between consecutive markers.
+  pr = pr[,,2:dim(pr)[3]] - pr[,,1:(dim(pr)[3] - 1)]
+  # Sum the founder columns.
+  pr = apply(pr, c(1, 3), sum)
+  rowSums(pr != 0)
+
+} # get_xo()
+
+xo1 = sapply(callan, get_xo)
+xo2 = sapply(divdb,  get_xo)
+```
+
+### Filter Out High and Low Crossover Mice
+
+
+
+```{r xo_mean_sd}
+total_xo = c(rowSums(xo1), rowSums(xo2))
+xo_mean = mean(log(total_xo))
+xo_sd   = sd(log(total_xo))
+ucl     = exp(xo_mean + xo_sd)
+lcl     = exp(xo_mean - xo_sd)
+```
+
+
+
+```{r fiter_xo}
+callan_xo = rowSums(xo1)
+divdb_xo  = rowSums(xo2)
+
+callan = callan[names(callan_xo)[callan_xo >= lcl & callan_xo <= ucl],]
+divdb  = divdb[names(divdb_xo)[divdb_xo >= lcl    & divdb_xo <= ucl],]
+```
+
+## Subset Samples
+
+Subset the samples to make sure that they are in the same order.
+
+```{r sample_intersect}
+samples = intersect(rownames(callan[[1]]), rownames(divdb[[1]]))
+```
+
+There are `r length(samples)` samples in the intersection.
+
+```{r subset_samples}
+for(i in seq_along(callan)) {
+  callan[[i]] = callan[[i]][samples,,]
+  divdb[[i]]  = divdb[[i]][samples,,]
+} # for(i)
+stopifnot(nrow(callan[[1]]) == nrow(divdb[[1]]))
+```
+
+## Convert Genoprobs to DOQTL Format
+
+```{r convert_to_3d}
+mkrs = unlist(sapply(callan, function(z) { dimnames(z)[[3]] }))
+tmp1 = array(0, dim = c(nrow(callan[[1]]), ncol(callan[[1]]), length(mkrs)), 
+             dimnames = list(rownames(callan[[1]]), colnames(callan[[1]]), mkrs))
+tmp2 = array(0, dim = c(nrow(callan[[1]]), ncol(callan[[1]]), length(mkrs)), 
+             dimnames = list(rownames(callan[[1]]), colnames(callan[[1]]), mkrs))
+chr_len = c(0, cumsum(sapply(callan, function(z) { dim(z)[3]})))
+
+for(i in seq_along(callan)) {
+  tmp1[,,(chr_len[i] + 1):chr_len[i+1]] = callan[[i]]
+  tmp2[,,(chr_len[i] + 1):chr_len[i+1]] = divdb[[i]]
+} # for(i)
+
+callan = tmp1
+divdb  = tmp2
+rm(tmp1, tmp2)
+```
+
+
+## Compare Samples
+
+For the purposes of determining whether samples are matched, I'm going to use the Pearson correlation between samples.
+
+```{r compare_samples}
+sample_cor = setNames(rep(0, nrow(callan)), rownames(callan))
+
+for(i in 1:nrow(callan)) {
+  sample_cor[i] = cor(as.vector(callan[i,,]), as.vector(divdb[i,,]))  
+} # for(i)
+```
+
+```{r}
+plot(sample_cor, las = 1, main = 'Correlation bewteen Callan & DivDB genoprobs',
+     xlab = 'Sample Index', ylab = 'Pearson Correlation', pch = 16)
+```
+
+Based on this plot, I don't see evidence for sample mixups between the Neogen data and the genoprobs object that Callan mapped with.
+
+
+
+
