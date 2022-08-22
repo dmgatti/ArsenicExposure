@@ -1,0 +1,171 @@
+---
+title: "Create Master Metadata File"
+author: "DMG"
+date: "8/18/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(readxl)
+library(tidyverse)
+
+base_dir = 'C:/Users/c-dgatti/Documents/projects/arsenic_do'
+data_dir = file.path(base_dir, 'data')
+meta_dir = file.path(data_dir, 'metadata')
+
+mouse_file = file.path(meta_dir, 'ArsenicAnimalMetadata.csv')
+dna_file   = file.path(meta_dir, 'sample_DNA_RNA_cross_reference.xlsx')
+mini_file  = file.path(meta_dir, 'callan_fibroblast_to_mini.csv')
+cell_file1 = file.path(meta_dir, 'cell_id_sex_generation.xlsx')
+cell_file2 = file.path(meta_dir, 'cell_line_metadata.csv')
+rna_file1  = file.path(meta_dir, 'RNAseq arsenic with fastq phase I.xlsx')
+rna_file2  = file.path(meta_dir, 'RNAseq_input.csv')
+```
+
+## Introduction
+
+The arsenic exposure study exposed live mice to different levels of arsenic via drinking water. Fibroblast cell lines were created from the tails of these mice and these cell lines were also exposed to arsenic at different doses. DNA was isolated from the spleens of the mice and was assayed on the Gigamuga. Samples that failed QC in the first batch were re-run in a second batch. The cell lines were also run on the Minimuga and Gigamuga and some of these were used to fill in live mouse genotypes. RNA was also isolated from the kidneys and GBRS was used to create a genoprobs object as well.
+
+There are several metadata files that connect mice to cell lines, DNA or RNA. The goal of this document is to combine all of the metadata files, check for inconsistencies, and produce a single, master metadata file.
+
+## Metadata Files
+
+The metadata files are listed below.
+
+* ArsenicAnimalMetadata.csv: Contains all of the live mice used in the study. 565 rows, 5 columns. Contains sex, generation, dose and birth date. Example mouse ID: A-10049-19
+* sample_DNA_RNA_cross_reference.xlsx: Contains mouse ID, DNA ID, Spleen ID. 571 rows, 4 columns. Example mouse ID: A-10049-19
+* callan_fibroblast_to_mini.csv: Contains information on mice, cell lines, tail tips, etc. 238 rows, 9 columns. Example mouse ID: A-100017-20
+* cell_id_sex_generation.xlsx: Contains mouse ID and cell line information. 54 rows, 6 columns. Example mouse ID: A-100019-20
+* cell_line_metadata.csv: Contains cell line and Gigamuga IDs. 227 rows, 5 columns. No mouse IDs. Individual column: 1366
+* RNAseq arsenic with fastq phase I.xlsx: Contains mouse IDs and FASTQ filenames for liver, kidney & heart samples at 0 and 10 ppm. Called "Phase I RNA-seq". 96 rows, 5 columns. Example mouse ID: A-100002-20
+* RNAseq_input.csv: Contains mouse ID and FASTQ filenames for kidney RNA-seq in 0 and 10 ppm groups. 181 rows, 7 columns. Example mouse ID: A-100003-20
+
+
+### Load Files
+
+```{r load_files}
+meta  = read_csv(mouse_file) %>%
+          rename_with(.fn = str_to_lower) %>%
+          rename_with(.fn = str_replace_all, pattern = ' ', replacement = '_')
+dna   = read_xlsx(dna_file) %>%
+          rename_with(.fn = str_to_lower) %>%
+          rename_with(.fn = str_replace_all, pattern = ' ', replacement = '_')
+mini  = read_csv(mini_file) %>%
+          rename_with(.fn = str_to_lower) %>%
+          rename_with(.fn = str_replace_all, pattern = ' ', replacement = '_')
+cell1 = read_xlsx(cell_file1) %>%
+          rename_with(.fn = str_to_lower) %>%
+          rename_with(.fn = str_replace_all, pattern = ' ', replacement = '_')
+cell2 = read_csv(cell_file2) %>%
+          rename_with(.fn = str_to_lower) %>%
+          rename_with(.fn = str_replace_all, pattern = ' ', replacement = '_')
+rna1  = read_xlsx(rna_file1) %>%
+          rename_with(.fn = str_to_lower) %>%
+          rename_with(.fn = str_replace_all, pattern = ' ', replacement = '_')
+rna2  = read_csv(rna_file2) %>%
+          rename_with(.fn = str_to_lower) %>%
+          rename_with(.fn = str_replace_all, pattern = ' ', replacement = '_')
+```
+
+## Merging Files
+
+The `meta` object should have all of the mice in the study. This came from Sue Sheehan and it contains sex, dose and generation information. I'm going to join to this file using its animal IDs. There are `r nrow(meta)` rows in the file. The column names are `r colnames(meta)`. I'm going to change 'name' to 'mouse'.
+
+First, let's make sure that the mouse IDs are unique.
+
+```{r mouse_ids_unique}
+meta = meta %>%
+         rename(mouse = name)
+meta %>%
+  count(mouse) %>%
+  count(n)
+```
+
+When we count the number of occurences of each mouse ID, there are 565 IDs that occur uniquely, which matches the number of rows. All of the mouse IDs are unique.
+
+### Merge DNA File
+
+Verify that all of the mouse IDs are unique.
+
+```{r dna_mouse_unique}
+dna = dna %>%
+        rename(mouse = animal)
+count(dna, mouse) %>% count(n)
+```
+
+All of the mouse IDs are unique. But we have more mice in this file than in the metadata file. 
+
+How many mice are there in a full join?
+
+```{r mouse_full_join}
+full_join(select(meta, mouse), select(dna, mouse)) %>%
+  nrow()
+```
+
+We have 11 more mice than there are in the metadata file.
+
+Which mouse IDs are in the metadata file, but not the DNA file?
+
+```{r sample_setdiff_meta_dna}
+anti_join(select(meta, mouse), select(dna, mouse))
+```
+
+There should be 6 more samples in `dna` than in `meta`.
+
+Which mouse IDs are in the DNA file, but not the metadata file?
+
+```{r sample_setdiff_dna_meta}
+anti_join(select(dna, mouse), select(meta, mouse))
+```
+
+So there are 5 mice in the metadata that are not in the DNA file and 11 mice in the DNA file that are not in the metadata. I'll retain them all in a full join, but we'll see if these mouse IDs show up again anywere else.
+
+```{r mouse_dna_full_join}
+meta = full_join(meta, dna, by = 'mouse')
+```
+
+Now `meta` has `r nrow(meta)` mice.
+
+### Merge Phase I RNA file
+
+Verify that all of the mouse IDs are unique.
+
+```{r rna1_mouse_unique}
+rna1 = rna1 %>%
+         rename(mouse = animal_id)
+count(rna1, mouse) %>% count(n)
+```
+
+They aren't unique because there are three tissues (heart, kidney, liver) for each sample. There are 96 rows, and each sample appears 3 times. So 3 x 32 = 96, which is correct.
+
+Remove everything execpt the sample ID from the FASTQ filename and reshape the data. It looks like these are single end reads.
+
+```{r fastq_reshape}
+rna1 = rna1 %>%
+         mutate(fastq_id = str_replace(fastq_id, '_GT21-[0-9]+_[ACGT]+-[ACGT]+_S[0-9]+_L[0-9]+_R1_[0-9]+.fastq.gz$', '')) %>% 
+  pivot_wider(names_from = 'tissue', values_from = 'fastq_id') %>% 
+  rename(dna_dose = dose,
+         dna_sex  = sex)
+```
+
+Join the metadata to `rna1` and verify that the sex and dose match in both data sets. 
+
+```{r}
+tmp = left_join(rna1, meta, by = 'mouse') %>% 
+        select(dna_dose, dna_sex, mouse, sex, diet) %>%
+        mutate(sex  = str_sub(sex, 1, 1),
+               dose = str_replace_all(diet, regex('^AIN-93M \\+ | ppm$'), ''),
+               dose = as.numeric(dose),
+               sex_equal  = sex  == dna_sex,
+               dose_equal = dose == dna_dose)
+```
+
+Are there any samples for which the sex or dose are incorrect?
+
+```{r}
+filter(tmp, !sex_equal | ! dose_equal)
+```
+
+There is one sample, A-10644-19, with mismatched sex and dose. I'm going to set the tissue sample IDs to NA since we can't be sure that this sample is correctly assigned.
