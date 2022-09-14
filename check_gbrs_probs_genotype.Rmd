@@ -1,0 +1,154 @@
+---
+title: "Compare GBRS Probs to Gene Diplotypes"
+author: "DMG"
+date: "8/30/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(AnnotationHub)
+library(ensembldb)
+library(qtl2)
+library(tidyverse)
+library(readxl)
+
+base_dir = 'C:/Users/c-dgatti/Documents/projects/arsenic_do'
+data_dir = file.path(base_dir, 'data')
+meta_dir = file.path(data_dir, 'metadata')
+res_dir  = file.path(base_dir, 'results')
+
+# Probs and genotype file.
+probs_file = file.path(base_dir, 'results', 'arsenic_gbrs_alleleprobs.rds')
+geno_file  = file.path(data_dir, 'allele_specific_gt.rds')
+
+# Metadata file.
+meta_file  = file.path(meta_dir, 'RNAseq_input.csv')
+
+marker_file = file.path(data_dir, 'ref.genome_grid.69k.noYnoMT_KBEdit.txt')
+
+ensembl_version = '99'
+hub = AnnotationHub()
+hub = query(hub, c('mus musculus', 'ensdb', ensembl_version))
+stopifnot(names(hub) == 'AH78811')
+ensembl = hub[['AH78811']]
+```
+
+## Introduction
+
+I am checking whether the diplotypes derived from the GBRS 69K grid genoprobs file match the diplotypes provided in the 'expected_counts' files for each gene.
+
+## Load Data
+
+```{r load_data}
+probs = readRDS(probs_file)
+geno  = readRDS(geno_file)
+meta  = read.csv(meta_file, header = FALSE)
+colnames(meta) = c('dose', 'sex', 'animal', 'fastq1', 'tissue', 'gen', 'fastq2')
+meta$sample = gsub('_GT22-[0-9]+_[ACGT]+-[ACGT]+_S[0-9]+_L[0-9]+_R1_[0-9]+\\.fastq\\.gz$', '', meta$fastq1)
+markers = read.delim(marker_file)
+```
+
+There are 282 samples in the genoprobs. There should be 182. See what's going on.
+
+```{r}
+sort(table(rownames(probs)), decreasing = TRUE)
+```
+
+Since the sequencing was paired end, I can understand why there might be two files per sample. But some samples have three files. And if paired end sequencing has two files per sample, then why do so many have only one file?
+
+```{r check_genoprobs_samples}
+unique_samples = unique(rownames(probs))
+
+dupl_same = setNames(rep(FALSE, length(unique_samples)), unique_samples)
+
+for(i in seq_along(unique_samples)) {
+
+  tmp = probs[rownames(probs) %in% unique_samples[i],,]
+  if(length(dim(tmp)) == 2) {
+    dupl_same[i] = TRUE
+  } else {
+    dupl_same[i] = all(tmp[1,,] == tmp[2,,])
+  }
+} # for(i)
+print(all(dupl_same))
+```
+
+All of the replicates have the same value. Only keep the unique sample IDs.
+
+```{r}
+probs = probs[unique(rownames(probs)),,]
+```
+
+Replace the RNA sample IDs with animal IDs.
+
+```{r}
+colnames(geno)  = gsub('_GT22-[0-9]+_[ACGT]+-[ACGT]+_S[0-9]+$', '', colnames(geno))
+colnames(geno)  = meta$animal[match(colnames(geno),  meta$sample)]
+rownames(probs) = meta$animal[match(rownames(probs), meta$sample)]
+```
+
+Make the order of the samples identical in genotypes and probs.
+
+```{r}
+geno = geno[,rownames(probs)]
+stopifnot(all(colnames(geno) == rownames(probs)))
+```
+
+Convert the probs to diplotypes. (This is a crude function but should be good enough for detecting massive issues.)
+
+```{r}
+get_geno = function(g) {
+  
+  g = round(2 * g)
+  gt = apply(g > 0, 1, function(z) { 
+                      z = apply(z, 2, which)
+                      z = lapply(z, names)
+                      sapply(z, paste0, collapse = '')
+                    })
+  wh = which(nchar(gt) == 1)
+  gt[wh] = paste0(gt[wh], gt[wh])
+  gt
+
+} # get_geno()
+
+probs_geno = get_geno(probs)
+```
+
+
+The 'geno' object contains diplotypes at gene locations. The 'probs_geno' object contains diplotypes at markers on the 69K grid. Get the gene locations and find the closest 69K marker to each gene. Then order the 'probs_geno' object to have the one row for each gene in 'geno' which contains the diplotypes for the marker nearest that gene.
+
+```{r}
+# Get the Ensembl gene locations and subset to retain the genes in our data.
+genes   = genes(ensembl)
+common_genes = intersect(genes$gene_id, rownames(geno))
+genes   = subset(genes, gene_id %in% common_genes)
+geno    = geno[genes$gene_id,]
+stopifnot(rownames(geno) == genes$gene_id)
+
+# Convert the markers to GRanges and, for each gene, get the nearest 69K grid marker.
+# The genes
+markers = GRanges(seqnames = markers$chr,
+                  ranges   = IRanges(start = markers$bp, width = 1),
+                  marker   = markers$marker)
+stopifnot(markers$marker == rownames(probs_geno))
+nearest_mkr = nearest(genes, markers)
+```
+
+Compare genotypes between the GBRS genoprobs and the expected counts genotypes.
+
+```{r}
+probs_geno = probs_geno[nearest_mkr,]
+stopifnot(dim(probs_geno) == dim(geno))
+stopifnot(colnames(probs_geno) == colnames(geno))
+geno_comp  = rowMeans(probs_geno == geno)
+```
+
+
+```{r}
+hist(geno_comp)
+```
+
+The genoprobs and expected counts generally match. The match may not be perfect because my genotype calling function is too simple. But there isn't a wholesale problem.
+

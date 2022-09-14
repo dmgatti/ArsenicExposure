@@ -1,0 +1,392 @@
+---
+title: "GBRS Genotype to Neogen Comparison"
+author: "DMG"
+date: "8/29/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(AnnotationHub)
+library(ensembldb)
+library(qtl2)
+library(tidyverse)
+library(readxl)
+
+base_dir    = 'C:/Users/c-dgatti/Documents/projects/arsenic_do'
+data_dir    = file.path(base_dir, 'data')
+meta_dir    = file.path(data_dir, 'metadata')
+results_dir = file.path(base_dir, 'results')
+
+source(file.path(base_dir, 'scripts', 'interpolate_genoprobs.R'))
+
+giga_probs_file = file.path(data_dir,    'churchill14__GigaMUGA_genoprobs_8state.rds')
+gbrs_probs_file = file.path(results_dir, 'arsenic_gbrs_alleleprobs.rds')
+gbrs_geno_file  = file.path(data_dir,    'allele_specific_gt.rds')
+
+giga_meta_file = file.path(meta_dir, 'sample_DNA_RNA_cross_reference.xlsx')
+gbrs_meta_file = file.path(meta_dir, 'RNAseq_input.csv')
+
+giga_marker_file = 'C:/Users/c-dgatti/Documents/muga/gm_uwisc_v1.csv'
+gbrs_marker_file = file.path(data_dir, 'ref.genome_grid.69k.noYnoMT_KBEdit.txt')
+
+ensembl_version = '99'
+hub = AnnotationHub()
+hub = query(hub, c('mus musculus', 'ensdb', ensembl_version))
+stopifnot(names(hub) == 'AH78811')
+ensembl = hub[['AH78811']]
+```
+
+## Introduction
+
+This analysis related to the Arsenic Exposure study in which mice and cell lines are exposed to arsenic and various relevant phenotypes were measured.
+
+GBRS outputs genoprobs on a 69,000 marker grid. It also provides two-letter genotype calls at each gene in the expected counts files. Earlier, I verified that the GBRS genoprobs largely match the Neogen genoprobs, indicating that there were not large-scale sample mixups.
+
+I now want to compare the genotypes in the expected counts file with the maximum marginal genotype call from the Neogen data. This will only be for the subset of ~165 samples which overlap between the two data sets. I previously gathered the genotypes from the individual expected counts files and combined them in one, large matrix.
+
+## Load Data
+
+```{r load_data}
+giga_probs = readRDS(giga_probs_file)
+gbrs_probs = readRDS(gbrs_probs_file)
+gbrs_geno  = readRDS(gbrs_geno_file)
+
+# Read in sample metadata.
+giga_meta = read_xlsx(giga_meta_file)
+gbrs_meta = read.csv(gbrs_meta_file, header = FALSE)
+colnames(gbrs_meta) = c('dose', 'sex', 'animal', 'fastq1', 'tissue', 'gen', 'fastq2')
+gbrs_meta$sample = gsub('_GT22-[0-9]+_[ACGT]+-[ACGT]+_S[0-9]+_L[0-9]+_R1_[0-9]+\\.fastq\\.gz$', '', gbrs_meta$fastq1)
+
+# Read in GBRS markers.
+giga_markers = read_csv(giga_marker_file)[,1:5]
+giga_markers = subset(giga_markers, !is.na(chr) & ! is.na(bp_mm10))
+giga_markers$chr[giga_markers$chr == 'M'] = 'MT'
+giga_markers = GRanges(seqnames = giga_markers$chr, 
+                       ranges   = IRanges(start = giga_markers$bp_mm10, width = 1),
+                       marker   = giga_markers$marker)
+gbrs_markers = read_delim(gbrs_marker_file)
+
+# Get Ensembl genes.
+genes = genes(ensembl)
+genes = keepStandardChromosomes(genes, pruning.mode = 'coarse')
+genes = subset(genes, seqnames %in% c(1:19, 'X'))
+
+# Get gene midpoints.
+genes_mid = GRanges(seqnames = seqnames(genes), 
+                   ranges   = IRanges(start = 0.5 * (end(genes) + start(genes)), width = 1),
+                   gene_id  = genes$gene_id)
+```
+
+Both the probs object and the GBRS genotypes have DNA or RNA sample IDs. Change these to mouse IDs and subset the data to contain the same samples in the same order.
+
+```{r add_mouse_ids}
+new_probs_names = gsub('^Jackson_Lab_(Korstanje|Reinholdt)_MURGIGV01_[0-9]+_|_[A-H][0-9]+$', '', 
+                       rownames(giga_probs[[1]]))
+  
+for(i in seq_along(giga_probs)) {
+  rownames(giga_probs[[i]]) = new_probs_names
+  giga_probs[[i]]           = giga_probs[[i]][rownames(giga_probs[[i]]) %in% giga_meta$`Extracted DNA`,,]
+  rownames(giga_probs[[i]]) = giga_meta$Animal[match(rownames(giga_probs[[i]]), giga_meta$`Extracted DNA`)]
+} # for(i)
+
+colnames(gbrs_geno) = gsub('_GT22-[0-9]+_[ACGT]+-[ACGT]+_S[0-9]+$', '', colnames(gbrs_geno))
+colnames(gbrs_geno) = gbrs_meta$animal[match(colnames(gbrs_geno), gbrs_meta$sample)]
+
+rownames(gbrs_probs) = gsub('_GT22-[0-9]+_[ACGT]+-[ACGT]+_S[0-9]+$', '', rownames(gbrs_probs))
+rownames(gbrs_probs) = gbrs_meta$animal[match(rownames(gbrs_probs), gbrs_meta$sample)]
+gbrs_probs           = gbrs_probs[!duplicated(rownames(gbrs_probs)),,]
+```
+
+Subset the genes from Ensembl and in GBRS genotypes to contain the same genes.
+
+```{r subset_genes}
+common_genes = intersect(genes_mid$gene_id, rownames(gbrs_geno))
+genes_mid    = subset(genes_mid, gene_id %in% common_genes)
+gbrs_geno    = gbrs_geno[genes_mid$gene_id,]
+
+stopifnot(rownames(gbrs_geno) == genes_mid$gene_id)
+```
+
+Subset markers in Gigamuga probs to match those in `giga_markers`.
+
+```{r subset_markers}
+common_markers = intersect(giga_markers$marker, unlist(sapply(giga_probs, function(z) { dimnames(z)[[3]] })))
+giga_markers   = subset(giga_markers, marker %in% common_markers)
+
+for(i in seq_along(giga_probs)) {
+  
+  giga_probs[[i]] = giga_probs[[i]][,,dimnames(giga_probs[[i]])[[3]] %in% common_markers]
+  
+} # for(i)
+
+stopifnot(length(giga_markers) == rowSums(sapply(giga_probs, dim))[3])
+```
+
+Get the two-letter genotype calls from the Gigamuga probs.
+
+```{r convert_probs2geno}
+# This is slow, but seems correct.
+get_geno = function(g) {
+
+  # Heterozygote / homozygote cutoff.
+  cutoff = 0.75
+ 
+  # Get maximum probs for each sample/marker.
+  maxg   = apply(g, c(1, 3), max)
+  whmaxg = apply(g, c(1, 3), which.max)
+  
+  # Create new genotype matrix.
+  gt = matrix('', nrow = nrow(g), ncol = dim(g)[3],
+              dimnames = list(rownames(g), dimnames(g)[[3]]))
+
+  # Handle homozygotes first.
+  homo     = which(maxg > cutoff)
+  let      = colnames(g)[whmaxg[homo]]
+  gt[homo] = paste0(let, let)
+  
+  # Handle hets.
+  for(i in 1:nrow(g)) {
+
+    # Get the sort order for the probs at this marker.
+    g_order = apply(g[i,,], 2, order, decreasing = TRUE)
+
+    # Get het samples.
+    het = which(maxg[i,] <= cutoff)
+    # Use the sort order from above to the the two highest probs from each
+    # het sample.
+    let = matrix(colnames(g)[g_order[1:2, het]], ncol = 2, byrow = TRUE)
+    # Sort founder alleles to be in alphabetical order.
+    let = apply(let, 1, sort)
+    # Insert het calls.
+    gt[i,het] = paste0(let[1,], let[2,])
+
+  } # for(i)
+
+  return(t(gt))
+  
+} # get_geno()
+
+fn = file.path(results_dir, 'giga_geno.rds')
+if(!file.exists(fn)) {
+  giga_geno = sapply(giga_probs, get_geno)
+  giga_geno = do.call(rbind, giga_geno)
+  saveRDS(giga_geno, file = fn)
+} else {
+  giga_geno = readRDS(file = fn)
+} # else
+```
+
+Are all of the GBRS samples in the Gigamuga dataset?
+
+```{r check_gbrs_in_giga}
+mean(colnames(gbrs_geno) %in% colnames(giga_geno))
+```
+
+Only 90% of the GBRS samples are in the Gigamuga data set. I still want to compare them with the Gigamuga data since one of those samples may have been mismatched. I want to not which samples do not appear in both data sets.
+
+```{r samples_not_in_both}
+samples_not_in_both = sort(colnames(gbrs_geno)[!colnames(gbrs_geno) %in% colnames(giga_geno)])
+
+samples_not_in_both
+```
+
+# Compare Gigmuga Genotypes to GBRS Gene Position Genotypes 
+
+Find the marker closest to each gene.
+
+```{r find_nearest_marker}
+nearest_mkr = nearest(genes_mid, giga_markers)
+```
+
+At each gene, verify that we have the correct two-letter genotype calls at each gene.
+
+```{r check_geno_at_genes}
+stopifnot(giga_markers$marker == rownames(giga_geno))
+stopifnot(rownames(gbrs_geno) == genes_mid$gene_id)
+
+# Reorder the Gigamuga genotypes to align the closest marker with each gene.
+# This may lead to a genotype row being repeated when more than one gene
+# is near a marker.
+giga_geno_genes = giga_geno[nearest_mkr,]
+
+geno_comp = matrix(0, nrow = ncol(gbrs_geno), ncol = ncol(giga_geno_genes),
+                   dimnames = list(colnames(gbrs_geno), colnames(giga_geno_genes)))
+for(i in 1:ncol(gbrs_geno)) {
+  
+  geno_comp[i,] = colMeans(gbrs_geno[,i] == giga_geno_genes)
+  
+} # for(i)
+```
+
+Get the Gigamuga sample ID that most closely matches each GBRS sample.
+
+```{r}
+gbrs_giga_comp = data.frame(gbrs_sample = rownames(geno_comp),
+                            giga_sample = colnames(geno_comp)[apply(geno_comp, 1, which.max)],
+                            sim         = apply(geno_comp, 1, max),
+                            self_sim    = geno_comp[cbind(1:nrow(geno_comp), match(rownames(geno_comp), colnames(geno_comp)))])
+gbrs_giga_comp$match = gbrs_giga_comp$gbrs_sample == gbrs_giga_comp$giga_sample
+gbrs_giga_comp = gbrs_giga_comp[order(gbrs_giga_comp$match),]
+
+gbrs_giga_comp
+```
+
+When comparing the GBRS allele calls to the Gigamuga allele calls, there are `r sum(gbrs_giga_comp$match == FALSE)` samples that match best with other samples. However, the `r sum(is.na(gbrs_giga_comp$match))` samples with 'NA' in the `self_sim` column above are not in both data sets.
+
+What is the distribution of the similarity scores?
+
+```{r}
+hist(gbrs_giga_comp$sim, breaks = 20)
+```
+
+Scores above 0.7 seem to indicate a good match.
+
+What is the mean and standard deviation of the samples that match?
+
+```{r}
+mean(gbrs_giga_comp$sim[gbrs_giga_comp$match == TRUE])
+sd(gbrs_giga_comp$sim[gbrs_giga_comp$match   == TRUE])
+```
+
+Which samples may be mismatched?
+
+```{r sample_mismatch_geno}
+gbrs_giga_comp[gbrs_giga_comp$match == FALSE & !is.na(gbrs_giga_comp$self_sim),]
+```
+
+```{r}
+write.csv(gbrs_giga_comp, file = file.path(results_dir, 'gbrs_giga_genotype_mismatch.csv'),
+          quote = FALSE, row.names = FALSE)
+```
+
+## Compare Gigamuga Genotypes to GBRS Genoprobs Genotypes
+
+Above, we took the two-letter diplotype assigned to each gene by EMASE and compared it to the Gigagmuga maximum marginal diplotype. Here, I will compare the GBRS maximum marginal diplotype to the Gigamuga maximum marginal diplotype. This may seem redundant, but I want to make sure that the genoprobs and genotypes are the same in GBRS.
+
+```{r}
+stopifnot(gbrs_markers$marker == dimnames(gbrs_probs)[[3]])
+
+rm(gbrs_geno, giga_geno_genes, geno_comp)
+```
+
+Inerpolate the Gigamuga genoprobs to the 69K grid.
+
+```{r interpoloate_setup}
+gbrs_markers = GRanges(seqnames = gbrs_markers$chr, ranges = IRanges(start = gbrs_markers$bp, width = 1),
+                       marker = gbrs_markers$marker)
+names(gbrs_markers) = gbrs_markers$marker
+
+tmp_mkr    = data.frame(marker = gbrs_markers$marker, chr = seqnames(gbrs_markers), pos = start(gbrs_markers))
+gbrs_probs = qtl2convert::probs_doqtl_to_qtl2(probs = gbrs_probs, map = tmp_mkr, pos_column = 'pos')
+markers2   = qtl2convert::map_df_to_list(tmp_mkr, pos_column = 'pos')
+tmp_mkr    = data.frame(marker = giga_markers$marker, chr = seqnames(giga_markers), pos = start(giga_markers))
+markers1   = qtl2convert::map_df_to_list(tmp_mkr, pos_column = 'pos')
+```
+
+```{r interpolate}
+giga_probs_69 = interpolate_genoprobs(giga_probs, markers1, markers2)
+```
+
+Make sure that the GBRS and Gigamuga probs are on the same grid.
+
+```{r}
+stopifnot(sapply(gbrs_probs, dim)[3,] == sapply(giga_probs_69, dim)[3,])
+```
+
+Compare each GBRS sample with each Gigamuga sample and record the simmilarity
+
+```{r gbrs_all_giga_comparison}
+rm(giga_probs)
+gc()
+# Convert the probs back to DOQTL format.
+gbrs_probs    = qtl2convert::probs_qtl2_to_doqtl(gbrs_probs)
+giga_probs_69 = qtl2convert::probs_qtl2_to_doqtl(giga_probs_69)
+
+# Convert the 3D arrays to 2D matrices with samples in columns.
+g1 = matrix(0, nrow = ncol(gbrs_probs)    * dim(gbrs_probs)[3],    ncol = nrow(gbrs_probs),
+            dimnames = list(NULL, rownames(gbrs_probs)))
+g2 = matrix(0, nrow = ncol(giga_probs_69) * dim(giga_probs_69)[3], ncol = nrow(giga_probs_69),
+            dimnames = list(NULL, rownames(giga_probs_69)))
+
+for(i in 1:nrow(gbrs_probs)) {
+  
+  g1[,i] = gbrs_probs[i,,]
+  
+} # for(i)
+gbrs_probs = g1
+rm(g1)
+
+for(i in 1:nrow(giga_probs_69)) {
+  
+  g2[,i] = giga_probs_69[i,,]
+  
+} # for(i)
+giga_probs_69 = g2
+rm(g2)
+
+# Get the similarity between samples.
+# I was using Pearson correlation, but then I plotted one sample versus
+# itself in the two dataset. Much of the piles up at specific points and I
+# wasn't sure how to interpret that.
+# So I'm multiplying the genoprobs by 2 and rounding. Then I get the proportion
+# of matching rounded genoprobs.
+gbrs_rnd = round(2 * gbrs_probs)
+giga_rnd = round(2 * giga_probs_69)
+
+sample_sim = matrix(0, nrow = ncol(gbrs_rnd), ncol = ncol(giga_rnd),
+                    dimnames = list(colnames(gbrs_rnd), colnames(giga_rnd)))
+for(i in 1:ncol(gbrs_rnd)) {
+  sample_sim[i,] = colMeans(gbrs_rnd[,i] == giga_rnd)
+} # for(i)
+
+```
+
+Which Gigamuga samples correlate best with the GBRS samples?
+
+```{r}
+sample_comp = data.frame(gbrs_mouse = rownames(sample_sim),
+                         giga_mouse = colnames(sample_sim)[apply(sample_sim, 1, which.max)],
+                         sim        = apply(sample_sim, 1, max),
+                         self_sim   = sample_sim[cbind(1:nrow(sample_sim), match(rownames(sample_sim), colnames(sample_sim)))])
+sample_comp$match = sample_comp$gbrs_mouse == sample_comp$giga_mouse
+sample_comp = sample_comp[order(sample_comp$match, decreasing = FALSE),]
+
+sample_comp
+```
+
+There are `r sum(sample_comp$match == FALSE)` samples that do not match with themselves. However, the ones with 'NA' in the `self_sim` column are not present in the Gigamuga dataset. There are `r sum(!is.na(sample_comp$self_sim) & sample_comp$match == FALSE)` samples that may be mismatched. 
+
+What is the distribution of the similarity scores?
+
+```{r}
+hist(sample_comp$sim, breaks = 20)
+```
+
+Scores above 0.9 indicate a match. Surprisingly, scores between 0.65 and 0.9 may not be matches.
+
+```{r}
+sample_comp[!is.na(sample_comp$self_sim) & sample_comp$match == FALSE,]
+```
+
+Many of these samples have good similarity with themselves. I'm not sure if it's possible for a sample to match better with a sibling.
+
+```{r}
+write.csv(sample_comp, file = file.path(results_dir, 'gbrs_giga_probs_mismatch.csv'),
+          quote = FALSE, row.names = FALSE)
+```
+
+## Summary
+
+Looking at the two tables of sample mismatches, there are some corrections that we can make.
+
+A-10491-19 in GBRS matches with A-10492-19 in the Gigamuga data.
+
+A-10487-19 in GBRS matches with A-10490-19 in the Gigamuga data.
+
+Otherwise, A-10354-19, A-10355-19, A-10356-19, A-10376-19, A-10378-19, A-10492-19, A-10493-19, A-10494-19 in the GBRS data don't have a good match in the Gigamuga data, even though there are samples with those IDs in the Gigamuga data.
+
+Samples A-10132-19, A-10133-19, A-10134-19, A-10162-19, A-10257-19, A-10258-19, A-10259-19, A-10261-19, A-10263-19, A-10264-19, A-10286-19, A-10287-19, A-10290-19, A-10292-19, A-10493-19, A-10494-19 are in the GBRS data, but not the Gigamuga data.
+
+
